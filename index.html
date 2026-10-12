@@ -27,6 +27,13 @@
 </div>
 <div id="hud">Right trigger: place · Left trigger: break · Right A/B: next/prev block · Left stick: move · Right stick: turn · Desktop: WASD</div>
 
+<script>
+// Show any startup error on screen, so problems are visible inside the headset too
+window.addEventListener('error', e => {
+  const box = document.getElementById('modstatus');
+  if (box) box.textContent = 'Error: ' + e.message;
+});
+</script>
 <script type="module">
 import * as THREE from 'three';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
@@ -39,7 +46,6 @@ const registry = new Map(); // name -> { description, color }
 
 function registerNode(name, description, color) {
   registry.set(name, { description, color: new THREE.Color(color) });
-  refreshHotbar();
 }
 
 registerNode('sandbox:grass', 'Grass', '#5a9e3a');
@@ -220,7 +226,7 @@ const controllers = [0, 1].map(i => {
     new THREE.LineBasicMaterial({ color: '#ffffff' })
   ));
   c.userData.hand = 'unknown';
-  c.addEventListener('connected', e => { c.userData.hand = e.data.handedness; });
+  c.addEventListener('connected', e => { c.userData.hand = e.data.handedness; showPreview(); });
   c.addEventListener('selectstart', () => {
     // Right trigger places, left trigger breaks
     if (c.userData.hand === 'right') placeOrBreak(c, true);
