@@ -1,0 +1,320 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Voxel VR Sandbox</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #fff; font-family: sans-serif; overflow: hidden; }
+  #panel { position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,.65); padding: 8px; border-radius: 6px; font-size: 13px; z-index: 5; }
+  #panel textarea { width: 300px; height: 110px; font-family: monospace; font-size: 12px; }
+  #hud { position: absolute; bottom: 8px; left: 8px; font-size: 13px; background: rgba(0,0,0,.55); padding: 6px 8px; border-radius: 6px; z-index: 5; }
+</style>
+<!-- Lua interpreter that runs in the browser, so mods can be written in Lua -->
+<script src="https://cdn.jsdelivr.net/npm/fengari-web@0.1.4/dist/fengari-web.js"></script>
+<script type="importmap">
+{ "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="panel">
+  <b>Mods (Lua)</b><br>
+  <textarea id="modsrc">minetest.register_node("sandbox:ruby", {description = "Ruby", color = "#c0245a"})</textarea><br>
+  <button id="loadmod">Load mod</button> <span id="modstatus"></span>
+</div>
+<div id="hud">Right trigger: place · Left trigger: break · Right A/B: next/prev block · Left stick: move · Right stick: turn · Desktop: WASD</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+
+const SPEED = 2.5;          // metres per second
+const SNAP_ANGLE = Math.PI / 6;
+
+// ---------- Block registry (filled by the game, then by Lua mods) ----------
+const registry = new Map(); // name -> { description, color }
+
+function registerNode(name, description, color) {
+  registry.set(name, { description, color: new THREE.Color(color) });
+  refreshHotbar();
+}
+
+registerNode('sandbox:grass', 'Grass', '#5a9e3a');
+registerNode('sandbox:dirt',  'Dirt',  '#7a5230');
+registerNode('sandbox:stone', 'Stone', '#808080');
+registerNode('sandbox:wood',  'Wood',  '#8b5a2b');
+registerNode('sandbox:leaves','Leaves','#2f7a2f');
+
+let selected = 0;
+function currentName() {
+  const names = [...registry.keys()];
+  return names[selected % names.length];
+}
+
+// ---------- Lua mod support (subset of the Luanti API) ----------
+const L = fengari.lauxlib.luaL_newstate();
+fengari.lualib.luaL_openlibs(L);
+
+// JS function that Lua can call
+fengari.interop.push(L, (name, description, color) => registerNode(name, description, color));
+fengari.lua.lua_setglobal(L, fengari.to_luastring('__register_node'));
+
+// Lua-side "minetest" table with the functions we support
+fengari.lauxlib.luaL_dostring(L, fengari.to_luastring(`
+  minetest = {}
+  function minetest.register_node(name, def)
+    __register_node(name, def.description or name, def.color or "#888888")
+  end
+`));
+
+function runMod(code) {
+  const status = fengari.lauxlib.luaL_dostring(L, fengari.to_luastring(code));
+  if (status !== fengari.lua.LUA_OK) {
+    return fengari.to_jsstring(fengari.lua.lua_tolstring(L, -1));
+  }
+  return null;
+}
+
+// ---------- Renderer, scene, player rig ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#9fd3ff');
+scene.fog = new THREE.Fog('#9fd3ff', 40, 90);
+
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 200);
+const rig = new THREE.Group();   // the player's position in the world
+rig.position.set(16, 8, 16);
+rig.add(camera);
+scene.add(rig);
+
+scene.add(new THREE.HemisphereLight('#ffffff', '#445533', 1.0));
+const sun = new THREE.DirectionalLight('#ffffff', 0.8);
+sun.position.set(1, 2, 1);
+scene.add(sun);
+
+addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+});
+
+// ---------- World storage and meshing ----------
+const world = new Map(); // "x,y,z" -> block name
+const key = (x, y, z) => `${x},${y},${z}`;
+
+function setBlock(x, y, z, name) {
+  if (name) world.set(key(x, y, z), name);
+  else world.delete(key(x, y, z));
+}
+
+// Simple rolling terrain
+const SIZE = 32;
+for (let x = 0; x < SIZE; x++) {
+  for (let z = 0; z < SIZE; z++) {
+    const h = 3 + Math.round(2 * Math.sin(x * 0.4) + 2 * Math.cos(z * 0.3));
+    for (let y = 0; y < h; y++) {
+      const name = y === h - 1 ? 'sandbox:grass'
+                 : y > h - 4 ? 'sandbox:dirt'
+                 : 'sandbox:stone';
+      setBlock(x, y, z, name);
+    }
+    if (x % 9 === 4 && z % 9 === 4) {          // a few simple trees
+      for (let y = h; y < h + 3; y++) setBlock(x, y, z, 'sandbox:wood');
+      for (let dx = -1; dx <= 1; dx++)
+        for (let dz = -1; dz <= 1; dz++)
+          setBlock(x + dx, h + 3, z + dz, 'sandbox:leaves');
+    }
+  }
+}
+
+// The six faces of a cube: neighbour offset, and the four corners (CCW from outside)
+const FACES = [
+  { n: [ 1, 0, 0], c: [[1,0,1],[1,1,1],[1,1,0],[1,0,0]] },
+  { n: [-1, 0, 0], c: [[0,0,0],[0,1,0],[0,1,1],[0,0,1]] },
+  { n: [ 0, 1, 0], c: [[0,1,0],[0,1,1],[1,1,1],[1,1,0]] },
+  { n: [ 0,-1, 0], c: [[0,0,1],[0,0,0],[1,0,0],[1,0,1]] },
+  { n: [ 0, 0, 1], c: [[0,0,1],[1,0,1],[1,1,1],[0,1,1]] },
+  { n: [ 0, 0,-1], c: [[1,0,0],[0,0,0],[0,1,0],[1,1,0]] },
+];
+
+const worldMesh = new THREE.Mesh(
+  new THREE.BufferGeometry(),
+  new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide })
+);
+scene.add(worldMesh);
+
+// Rebuild the mesh with only the faces that touch air
+function rebuildMesh() {
+  const pos = [], nor = [], col = [], idx = [];
+  for (const [k, name] of world) {
+    const [x, y, z] = k.split(',').map(Number);
+    const c = registry.get(name)?.color ?? new THREE.Color('#ff00ff');
+    for (const f of FACES) {
+      if (world.has(key(x + f.n[0], y + f.n[1], z + f.n[2]))) continue;
+      const base = pos.length / 3;
+      for (const p of f.c) {
+        pos.push(x + p[0], y + p[1], z + p[2]);
+        nor.push(f.n[0], f.n[1], f.n[2]);
+        col.push(c.r, c.g, c.b);
+      }
+      idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  g.setIndex(idx);
+  worldMesh.geometry.dispose();
+  worldMesh.geometry = g;
+}
+rebuildMesh();
+
+// ---------- Ray-based block picking ----------
+function raycast(origin, dir, maxDist = 8) {
+  let prev = null, lastKey = null;
+  for (let t = 0; t < maxDist; t += 0.03) {
+    const x = Math.floor(origin.x + dir.x * t);
+    const y = Math.floor(origin.y + dir.y * t);
+    const z = Math.floor(origin.z + dir.z * t);
+    const k = key(x, y, z);
+    if (k === lastKey) continue;
+    lastKey = k;
+    if (world.has(k)) return { hit: [x, y, z], prev };
+    prev = [x, y, z];
+  }
+  return null;
+}
+
+function placeOrBreak(controller, place) {
+  const origin = new THREE.Vector3();
+  const dir = new THREE.Vector3();
+  controller.getWorldPosition(origin);
+  controller.getWorldDirection(dir).negate();   // controllers point along -Z
+  const res = raycast(origin, dir);
+  if (!res) return;
+  if (place && res.prev) setBlock(...res.prev, currentName());
+  if (!place) setBlock(...res.hit, null);
+  rebuildMesh();
+}
+
+// ---------- Controllers: trigger, ray, hand-held block preview ----------
+const preview = new THREE.Mesh(
+  new THREE.BoxGeometry(0.12, 0.12, 0.12),
+  new THREE.MeshLambertMaterial()
+);
+const controllers = [0, 1].map(i => {
+  const c = renderer.xr.getController(i);
+  scene.add(c);
+  c.add(new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,-8)]),
+    new THREE.LineBasicMaterial({ color: '#ffffff' })
+  ));
+  c.userData.hand = 'unknown';
+  c.addEventListener('connected', e => { c.userData.hand = e.data.handedness; });
+  c.addEventListener('selectstart', () => {
+    // Right trigger places, left trigger breaks
+    if (c.userData.hand === 'right') placeOrBreak(c, true);
+    if (c.userData.hand === 'left') placeOrBreak(c, false);
+  });
+  return c;
+});
+
+function showPreview() {
+  const right = controllers.find(c => c.userData.hand === 'right');
+  if (!right) return;
+  preview.material.color.copy(registry.get(currentName())?.color ?? new THREE.Color('#fff'));
+  if (preview.parent !== right) right.add(preview);
+  preview.position.set(0, 0, -0.15);
+}
+
+// ---------- Hotbar text (desktop HUD) ----------
+const hud = document.getElementById('hud');
+function refreshHotbar() {
+  if (!registry.has(currentName())) selected = 0;
+  const name = currentName();
+  const label = document.getElementById('blocklabel') ?? Object.assign(document.createElement('div'), { id: 'blocklabel' });
+  label.textContent = `Block: ${registry.get(name)?.description ?? name}  (${selected + 1}/${registry.size})`;
+  if (!label.parentNode) hud.appendChild(label);
+  showPreview();
+}
+refreshHotbar();
+
+// ---------- Input polling: thumbsticks and A/B buttons ----------
+const keys = {};
+addEventListener('keydown', e => keys[e.code] = true);
+addEventListener('keyup', e => keys[e.code] = false);
+
+const tmpDir = new THREE.Vector3(), tmpRight = new THREE.Vector3(), up = new THREE.Vector3(0, 1, 0);
+function moveRig(forward, strafe, dt) {
+  camera.getWorldDirection(tmpDir);
+  tmpDir.y = 0;
+  tmpDir.normalize();
+  tmpRight.crossVectors(tmpDir, up).normalize();
+  rig.position.addScaledVector(tmpDir, forward * SPEED * dt);
+  rig.position.addScaledVector(tmpRight, strafe * SPEED * dt);
+}
+
+const deadzone = v => (Math.abs(v) < 0.15 ? 0 : v);
+const prevButtons = {};
+let turnCooldown = 0;
+
+function pollGamepads(dt) {
+  const session = renderer.xr.getSession();
+  if (!session) return;
+  turnCooldown = Math.max(0, turnCooldown - dt);
+  for (const src of session.inputSources) {
+    const gp = src.gamepad;
+    if (!gp) continue;
+    const hand = src.handedness;
+    const x = deadzone(gp.axes[2] ?? 0);
+    const y = deadzone(gp.axes[3] ?? 0);
+
+    if (hand === 'left') moveRig(-y, x, dt);
+
+    if (hand === 'right') {
+      if (turnCooldown === 0 && Math.abs(x) > 0.7) {
+        rig.rotation.y -= Math.sign(x) * SNAP_ANGLE;
+        turnCooldown = 0.3;
+      }
+      // A = next block, B = previous block (edge-triggered)
+      const a = gp.buttons[4]?.pressed, b = gp.buttons[5]?.pressed;
+      if (a && !prevButtons.a) { selected++; refreshHotbar(); }
+      if (b && !prevButtons.b) { selected--; refreshHotbar(); }
+      prevButtons.a = a; prevButtons.b = b;
+    }
+  }
+}
+
+// ---------- Mod panel ----------
+document.getElementById('loadmod').addEventListener('click', () => {
+  const err = runMod(document.getElementById('modsrc').value);
+  document.getElementById('modstatus').textContent = err ? `Error: ${err}` : 'Loaded';
+  if (!err) { rebuildMesh(); refreshHotbar(); }
+});
+
+// ---------- Main loop ----------
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  if (renderer.xr.isPresenting) {
+    pollGamepads(dt);
+  } else {
+    const fwd = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0);
+    const str = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
+    if (fwd || str) moveRig(fwd, str, dt);
+  }
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
