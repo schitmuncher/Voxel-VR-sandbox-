@@ -72,20 +72,26 @@ function currentName() {
 }
 
 // ---------- Lua mod support (subset of the Luanti API) ----------
-const L = fengari.lauxlib.luaL_newstate();
-fengari.lualib.luaL_openlibs(L);
-
-fengari.interop.push(L, (name, description, color) => { registerNode(name, description, color); });
-fengari.lua.lua_setglobal(L, fengari.to_luastring('__register_node'));
-
-fengari.lauxlib.luaL_dostring(L, fengari.to_luastring(`
-  minetest = {}
-  function minetest.register_node(name, def)
-    __register_node(name, def.description or name, def.color or "#888888")
-  end
-`));
+// If the Lua engine fails to load, the game still runs; only mods are unavailable
+let L = null;
+try {
+  L = fengari.lauxlib.luaL_newstate();
+  fengari.lualib.luaL_openlibs(L);
+  fengari.interop.push(L, (name, description, color) => { registerNode(name, description, color); });
+  fengari.lua.lua_setglobal(L, fengari.to_luastring('__register_node'));
+  fengari.lauxlib.luaL_dostring(L, fengari.to_luastring(`
+    minetest = {}
+    function minetest.register_node(name, def)
+      __register_node(name, def.description or name, def.color or "#888888")
+    end
+  `));
+} catch (e) {
+  console.warn('Lua engine did not load', e);
+  L = null;
+}
 
 function runMod(code) {
+  if (!L) return 'Lua engine did not load, so mods are unavailable';
   const status = fengari.lauxlib.luaL_dostring(L, fengari.to_luastring(code));
   if (status !== fengari.lua.LUA_OK) {
     return fengari.to_jsstring(fengari.lua.lua_tolstring(L, -1));
